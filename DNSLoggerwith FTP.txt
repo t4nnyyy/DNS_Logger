@@ -1,0 +1,122 @@
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <ESP8266FtpClient.h>
+
+const char* apSSID = "ESP_DNS_HTTP";
+const char* apPassword = "esp8266proxy";
+
+const char* staSSID = "WIFI_SSID";       // Your Wi-Fi Router Name
+const char* staPassword = "WIFI_PASSWORD";   // Your Wi-Fi Router Password
+
+// FTP credentials
+const char* ftp_server = "192.168.XX.XXX";
+const char* ftp_user = "FTP_USERNAME";
+const char* ftp_pass = "FTP_PASSWORD";
+
+WiFiUDP udp;
+WiFiUDP dnsForwarder;
+IPAddress googleDNS(8, 8, 8, 8);
+char dnsLog[512];
+int logIndex = 0;
+
+const int dnsPort = 53;
+
+void setup() {
+ Serial.begin(115200);
+
+  // Dual mode: Station + Access Point
+  WiFi.mode(WIFI_AP_STA);
+
+  // Connect to your Wi-Fi router (STA mode)
+  WiFi.begin(staSSID, staPassword);
+  Serial.print("Connecting to router");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to router:");
+  Serial.println(WiFi.localIP());
+
+  // Create access point for clients (AP mode)
+  WiFi.softAP(apSSID, apPassword);
+  Serial.println("Access Point Started:");
+  Serial.println(WiFi.softAPIP());
+
+  udp.begin(dnsPort);
+  dnsForwarder.begin(dnsPort + 1);
+}
+
+void loop() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    byte buffer[512];
+    udp.read(buffer, packetSize);
+
+    IPAddress clientIP = udp.remoteIP();
+    uint16_t clientPort = udp.remotePort();
+
+    // Parse domain name (basic)
+    String domain = parseDomainName(buffer);
+    Serial.println("DNS Query: " + domain);
+
+    // Log it
+    domain += "\n";
+    domain.toCharArray(&dnsLog[logIndex], domain.length() + 1);
+    logIndex += domain.length();
+
+    // Forward to actual DNS server
+    dnsForwarder.beginPacket(googleDNS, dnsPort);
+    dnsForwarder.write(buffer, packetSize);
+    dnsForwarder.endPacket();
+
+    // Wait for reply
+    delay(100);
+    int replySize = dnsForwarder.parsePacket();
+    if (replySize) {
+      byte reply[512];
+      dnsForwarder.read(reply, replySize);
+
+      // Send back to original client
+      udp.beginPacket(clientIP, clientPort);
+      udp.write(reply, replySize);
+      udp.endPacket();
+    }
+
+    // Upload logs if buffer full
+    if (logIndex > 400) {
+      uploadLogs();
+    }
+  }
+}
+
+String parseDomainName(byte* buffer) {
+  String domain = "";
+  int pos = 12;
+  while (buffer[pos] != 0) {
+    int len = buffer[pos];
+    for (int i = 1; i <= len; i++) {
+      domain += (char)buffer[pos + i];
+    }
+    domain += ".";
+    pos += len + 1;
+  }
+  domain.remove(domain.length() - 1);  // remove trailing dot
+  return domain;
+}
+
+void uploadLogs() {
+  Serial.println("Uploading logs to FTP...");
+  ESP8266FtpClient ftp(ftp_server, "21", ftp_user, ftp_pass);
+  ftp.OpenConnection();
+  ftp.ChangeWorkDir("/");
+  ftp.InitFile("Type A");
+  ftp.NewFile("dns_log.txt");
+  ftp.WriteData(dnsLog, logIndex);
+  ftp.CloseFile();
+  ftp.CloseConnection();
+  Serial.println("Upload complete.");
+
+  // Clear log
+  logIndex = 0;
+  memset(dnsLog, 0, sizeof(dnsLog));
+}
